@@ -1,0 +1,97 @@
+# oss agent worker v1
+name: OSS Agent Worker
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'
+
+permissions:
+  contents: write
+  id-token: write
+  pull-requests: write
+
+concurrency:
+  group: oss-agent-worker
+  cancel-in-progress: false
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Get GitHub OIDC token
+        id: oidc
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=oss-agent-supabase"
+          token_json=$(curl -fsSL -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "$url")
+          token=$(printf '%s' "$token_json" | jq -r '.value')
+          test -n "$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch next queued task
+        id: task
+        shell: bash
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -euo pipefail
+          response=$(curl -fsSL -H "Authorization: Bearer ${OIDC_TOKEN}" -H 'Content-Type: application/json' -d '{"action":"next_task"}' 'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker')
+          printf '%s' "$response" > /tmp/task-response.json
+          task_id=$(jq -r '.task.id // empty' /tmp/task-response.json)
+          if [ -z "$task_id" ]; then echo 'has_task=false' >> "$GITHUB_OUTPUT"; exit 0; fi
+          echo 'has_task=true' >> "$GITHUB_OUTPUT"
+          echo "task_id=$task_id" >> "$GITHUB_OUTPUT"
+          jq -c '.task' /tmp/task-response.json > /tmp/task.json
+
+      - name: Create upstream pull request
+        if: steps.task.outputs.has_task == 'true'
+        id: apply
+        shell: bash
+        env:
+          UPSTREAM_TOKEN: ${{ secrets.OSS_AGENT_GITHUB_TOKEN }}
+          DEFAULT_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          task_type=$(jq -r '.task_type' /tmp/task.json)
+          test "$task_type" = 'github_create_pr'
+          branch=$(jq -r '.branch_name' /tmp/task.json)
+          base_ref=$(jq -r '.base_ref' /tmp/task.json)
+          upstream_repo=$(jq -r '.upstream_repo' /tmp/task.json)
+          title=$(jq -r '.title' /tmp/task.json)
+          body=$(jq -r '.body' /tmp/task.json)
+          head=$(jq -r '.head' /tmp/task.json)
+          token="$UPSTREAM_TOKEN"; if [ -z "$token" ]; then token="$DEFAULT_GITHUB_TOKEN"; fi
+          payload=$(jq -n --arg title "$title" --arg head "$head" --arg base "$base_ref" --arg body "$body" '{title:$title,head:$head,base:$base,body:$body,maintainer_can_modify:true}')
+          http=$(curl -sS -o /tmp/pr-response.json -w '%{http_code}' -X POST -H "Authorization: Bearer ${token}" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' -H 'Content-Type: application/json' --data-binary "$payload" "https://api.github.com/repos/${upstream_repo}/pulls")
+          if [ "$http" != '201' ]; then echo "Upstream PR creation failed HTTP $http" >&2; cat /tmp/pr-response.json >&2 || true; exit 20; fi
+          echo "pr_url=$(jq -r '.html_url' /tmp/pr-response.json)" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$(jq -r '.number' /tmp/pr-response.json)" >> "$GITHUB_OUTPUT"
+          echo "upstream_repo=$upstream_repo" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Report success
+        if: steps.task.outputs.has_task == 'true' && success()
+        shell: bash
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          TASK_ID: ${{ steps.task.outputs.task_id }}
+          PR_URL: ${{ steps.apply.outputs.pr_url }}
+          PR_NUMBER: ${{ steps.apply.outputs.pr_number }}
+          UPSTREAM_REPO: ${{ steps.apply.outputs.upstream_repo }}
+          BRANCH: ${{ steps.apply.outputs.branch }}
+        run: |
+          jq -n --argjson task_id "$TASK_ID" --arg pr_url "$PR_URL" --arg pr_number "$PR_NUMBER" --arg upstream_repo "$UPSTREAM_REPO" --arg branch "$BRANCH" '{action:"report",status:"completed",task_id:$task_id,result:{branch:$branch,pr_url:$pr_url,pr_number:($pr_number|tonumber),upstream_repo:$upstream_repo}}' >/tmp/report.json
+          curl -fsSL -H "Authorization: Bearer ${OIDC_TOKEN}" -H 'Content-Type: application/json' --data-binary @/tmp/report.json 'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker'
+
+      - name: Report failure
+        if: steps.task.outputs.has_task == 'true' && failure()
+        shell: bash
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          TASK_ID: ${{ steps.task.outputs.task_id }}
+        run: |
+          jq -n --argjson task_id "$TASK_ID" '{action:"report",status:"failed",task_id:$task_id,error:"GitHub Actions upstream PR creation failed; authorization is required if HTTP 403."}' >/tmp/report-failure.json
+          curl -fsSL -H "Authorization: Bearer ${OIDC_TOKEN}" -H 'Content-Type: application/json' --data-binary @/tmp/report-failure.json 'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker' || true
